@@ -1,0 +1,7 @@
+#!/usr/bin/env sh
+set -eu
+mkdir -p ~/.cache/zig
+zig=$(readlink -f $(which zig))
+./zig-out/bin/fsveil \
+    --start-mount-opt nosuid,noexec,nodev,private,recursive /dev /proc --end-mount-opt \
+    ~/.cache/zig $(dirname $zig) . -- $zig "$@"
