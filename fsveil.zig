@@ -37,6 +37,7 @@ pub fn main() !void {
     var opt: struct {
         next_argv: ?[*:null]?[*:0]u8 = null,
         keep_readwrite: bool = false,
+        tmp_sysroot: ?[:0]u8 = null,
     } = .{};
 
     var new_argc: usize = 1;
@@ -62,6 +63,8 @@ pub fn main() !void {
                     os.exit(0xff);
                 }
                 mount_options_list.items[mount_options_list.items.len - 1].end = new_argc - 1;
+            } else if (std.mem.eql(u8, arg, "--tmp-sysroot")) {
+                opt.tmp_sysroot = std.mem.span(getCmdlineOption(&arg_index));
             } else {
                 os.argv[new_argc] = arg.ptr;
                 new_argc += 1;
@@ -82,7 +85,7 @@ pub fn main() !void {
         os.exit(0xff);
     };
     const sysroot_paths = os.argv[1..new_argc];
-    const sysroot_path = pickSysrootMount(sysroot_paths);
+    const sysroot_path = opt.tmp_sysroot orelse pickSysrootMount(sysroot_paths);
 
     const pre_unshare_uids = getUids();
     std.log.info("PreUnshare Uids: {}", .{pre_unshare_uids});
