@@ -364,7 +364,7 @@ const MountOptions = struct {
 fn shell(name: []const u8) !void {
     var child = std.ChildProcess.init(&[_][]const u8{name}, std.heap.page_allocator);
     try child.spawn();
-    const result = child.wait();
+    const result = try child.wait();
     std.log.info("shell exited with {}", .{result});
     os.exit(0);
 }
