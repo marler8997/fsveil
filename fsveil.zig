@@ -204,15 +204,18 @@ pub fn main() !void {
             };
 
             var opt_mount_options: ?*MountOptions = null;
-            if (mount_option_index < mount_options_list.items.len and
-                path_index >= mount_options_list.items[mount_option_index].start) {
-
-                opt_mount_options = &mount_options_list.items[mount_option_index];
-                if (opt_mount_options.?.end) |end| {
-                    if (path_index == end) {
+            while (true) {
+                if (mount_option_index == mount_options_list.items.len) break;
+                const current = &mount_options_list.items[mount_option_index];
+                if (path_index < current.start) break;
+                if (current.end) |end| {
+                    if (path_index >= end) {
                         mount_option_index += 1;
+                        continue;
                     }
                 }
+                opt_mount_options = current;
+                break;
             }
 
             if (opt_mount_options) |mount_options| {
