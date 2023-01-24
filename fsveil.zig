@@ -252,7 +252,7 @@ pub fn main() !void {
                         }
                         continue;
                     }
-                    std.log.err("mount failed, errno=E{s}", .{@tagName(errno)});
+                    std.log.err("mount '{s}' to '{s}' flags=0x{x} failed, errno=E{s}", .{path, path_in_sysroot, flags, @tagName(errno)});
                     os.exit(0xff);
                 },
             }
