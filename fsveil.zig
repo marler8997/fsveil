@@ -49,7 +49,7 @@ pub fn main() !void {
         while (arg_index < os.argv.len) : (arg_index += 1) {
             const arg = std.mem.span(os.argv[arg_index]);
             if (std.mem.eql(u8, arg, "--")) {
-                opt.next_argv = @ptrCast([*:null]?[*:0]u8, os.argv[arg_index + 1 ..].ptr);
+                opt.next_argv = @ptrCast(os.argv[arg_index + 1 ..].ptr);
                 break;
             } else if (std.mem.eql(u8, arg, "--link")) {
                 const to = getCmdlineOption(&arg_index);
@@ -136,7 +136,7 @@ pub fn main() !void {
     }
 
     std.log.info("marking all mounts as private", .{});
-    switch (os.errno(mount("none", "/", null, os.linux.MS.REC | os.linux.MS.PRIVATE, 0))) {
+    switch (os.errno(os.linux.mount("none", "/", null, os.linux.MS.REC | os.linux.MS.PRIVATE, 0))) {
         .SUCCESS => {},
         else => |errno| {
             std.log.err("mount failed with E{s}", .{@tagName(errno)});
@@ -156,7 +156,7 @@ pub fn main() !void {
     //try shell("sh");
     var mount_option_index: usize = 0;
 
-    for (sysroot_paths) |path_ptr, path_index| {
+    for (sysroot_paths, 0..) |path_ptr, path_index| {
         var stat: os.linux.Stat = undefined;
         switch (os.errno(os.linux.stat(path_ptr, &stat))) {
             .SUCCESS => {},
@@ -234,13 +234,13 @@ pub fn main() !void {
                 mount_data = mount_options.data;
             }
 
-            switch (os.errno(mount(path, path_in_sysroot, mount_data, flags, 0))) {
+            switch (os.errno(os.linux.mount(path, path_in_sysroot, mount_data, flags, 0))) {
                 .SUCCESS => {},
                 else => |errno| {
                     // for some reason I can bind mount /proc on my NixOS machine but not my Ubuntu machine?
                     if (std.mem.eql(u8, path, "/proc")) {
                         std.log.warn("failed to bind mount /proc with E{s}, gonna try to mount it directly", .{@tagName(errno)});
-                        switch (os.errno(mount("none", "/proc", null, os.linux.MS.PRIVATE | os.linux.MS.REC, 0))) {
+                        switch (os.errno(os.linux.mount("none", "/proc", null, os.linux.MS.PRIVATE | os.linux.MS.REC, 0))) {
                             .SUCCESS => {},
                             else => |errno2| {
                                 std.log.warn("failed to mount it directly(at 0) also with E{s}", .{@tagName(errno2)});
@@ -248,7 +248,7 @@ pub fn main() !void {
                                 os.exit(0xff);
                             },
                         }
-                        switch (os.errno(mount("proc", path_in_sysroot, "proc", os.linux.MS.NOSUID | os.linux.MS.NOEXEC | os.linux.MS.NODEV, 0))) {
+                        switch (os.errno(os.linux.mount("proc", path_in_sysroot, "proc", os.linux.MS.NOSUID | os.linux.MS.NOEXEC | os.linux.MS.NODEV, 0))) {
                             .SUCCESS => {},
                             else => |errno2| {
                                 std.log.warn("failed to mount it directly(at 1) also with E{s}", .{@tagName(errno2)});
@@ -281,7 +281,7 @@ pub fn main() !void {
     for (links.items) |link| {
         std.log.info("ln -s '{s}' '{s}'", .{ std.mem.span(link.to), link.from });
         var from_path_buf: [std.fs.MAX_PATH_BYTES + 1]u8 = undefined;
-        const from_path = try std.fmt.bufPrintZ(&from_path_buf, "{s}{s}", .{ sysroot_path, std.mem.span(link.from) });
+        const from_path = try std.fmt.bufPrintZ(&from_path_buf, "{s}{s}", .{ sysroot_path, link.from });
         if (std.fs.path.dirname(from_path)) |from_dir| {
             try std.fs.cwd().makePath(from_dir);
         }
@@ -300,7 +300,7 @@ pub fn main() !void {
         std.log.warn("keeping veil root writable", .{});
     } else {
         std.log.info("remounting veil root as readonly...", .{});
-        switch (os.errno(mount("none", sysroot_path, null, os.linux.MS.REMOUNT | os.linux.MS.RDONLY, 0))) {
+        switch (os.errno(os.linux.mount("none", sysroot_path, null, os.linux.MS.REMOUNT | os.linux.MS.RDONLY, 0))) {
             .SUCCESS => {},
             else => |errno| {
                 std.log.err("remount viel root as readonly failed with E{s}", .{@tagName(errno)});
@@ -321,13 +321,13 @@ pub fn main() !void {
     std.log.info("chroot successful!", .{});
 
     std.log.info("cd '{s}'", .{cwd_path});
-    try os.chdirZ(std.meta.assumeSentinel(cwd_path, 0));
+    try os.chdirZ(@ptrCast(cwd_path));
 
     std.log.info("execve '{s}'", .{next_program});
     const errno = os.linux.execve(
         next_program,
         next_argv,
-        @ptrCast([*:null]const ?[*:0]const u8, os.environ.ptr),
+        @ptrCast(os.environ.ptr),
     );
     std.log.err("execve failed, errno={}", .{errno});
     os.exit(0xff);
@@ -434,9 +434,4 @@ fn getGids() Ids {
         },
     }
     return ids;
-}
-
-// TODO: workaround non-optional fstype argument: https://github.com/ziglang/zig/pull/11889
-pub fn mount(special: [*:0]const u8, dir: [*:0]const u8, fstype: ?[*:0]const u8, flags: u32, data: usize) usize {
-    return os.linux.syscall5(.mount, @ptrToInt(special), @ptrToInt(dir), @ptrToInt(fstype), flags, data);
 }

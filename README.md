@@ -19,4 +19,4 @@ compiler with minimal access to the filesystem.
 
 ### Build
 
-Build tested with zig version 0.10.0
+Build tested with zig version 0.11.0
