@@ -10,8 +10,11 @@ fn usage() !void {
         \\Usage: fsveil [OPTIONS...] FILES/DIRS -- CMD...
         \\
         \\Options:
-        \\    --start-mount-opt opt1,opt2,...   Mount the following with the given mount options
-        \\    --end-mount-opt                   End the previous --start-mount-opt
+        \\    --link TARGET LINK_NAME                   Create symlink LINK_NAME -> TARGET inside the veil
+        \\    --start-mount-opt opt1,opt2,... DIRS...   Mount the following with the given mount options
+        \\    --end-mount-opt                           End the previous --start-mount-opt
+        \\    --keep-rw                                 Don't remount the veil as readonly
+        \\    --tmp-sysroot PATH                        Override the default sysroot mount path (i.e. /mnt or /tmp)
         \\
     );
 }
