@@ -16,3 +16,7 @@ fsveil --start-mount-opt nosuid,noexec /sys /proc /tmp --end-mount-opt ...
 
 Checkout [zig-fsveil](zig-fsveil) for an example script that will run the zig
 compiler with minimal access to the filesystem.
+
+### Build
+
+Build tested with zig version 0.10.0
