@@ -1,5 +1,6 @@
 const std = @import("std");
 const os = std.os;
+const posix = std.posix;
 
 pub const log_level: std.log.Level = .warn;
 
@@ -11,6 +12,8 @@ fn usage() !void {
         \\
         \\Options:
         \\    --link TARGET LINK_NAME                   Create symlink LINK_NAME -> TARGET inside the veil
+        \\    --bind-mount-host SRC DST                 Bind mount host directory SRC to DST
+        \\    --tmpfs PATH                              Bind a writeable tmpfs to PATH
         \\    --start-mount-opt opt1,opt2,... DIRS...   Mount the following with the given mount options
         \\    --end-mount-opt                           End the previous --start-mount-opt
         \\    --keep-rw                                 Don't remount the veil as readonly
@@ -25,17 +28,12 @@ fn getCmdlineOption(i: *usize) [*:0]u8 {
     i.* += 1;
     if (i.* >= os.argv.len) {
         std.log.err("command-line option '{s}' requires an argument", .{os.argv[i.* - 1]});
-        os.exit(0xff);
+        posix.exit(0xff);
     }
     return os.argv[i.*];
 }
 
 pub fn main() !void {
-    const Link = struct {
-        to: [*:0]u8,
-        from: [:0]u8,
-    };
-    var links = std.ArrayListUnmanaged(Link){};
     var mount_options_list = std.ArrayListUnmanaged(MountOptions){};
     var opt: struct {
         next_argv: ?[*:null]?[*:0]u8 = null,
@@ -52,9 +50,19 @@ pub fn main() !void {
                 opt.next_argv = @ptrCast(os.argv[arg_index + 1 ..].ptr);
                 break;
             } else if (std.mem.eql(u8, arg, "--link")) {
-                const to = getCmdlineOption(&arg_index);
-                const from = std.mem.span(getCmdlineOption(&arg_index));
-                try links.append(arena.allocator(), .{ .to = to, .from = from });
+                os.argv[new_argc + 0] = arg.ptr;
+                os.argv[new_argc + 1] = getCmdlineOption(&arg_index);
+                os.argv[new_argc + 2] = getCmdlineOption(&arg_index);
+                new_argc += 3;
+            } else if (std.mem.eql(u8, arg, "--bind-mount-host")) {
+                os.argv[new_argc + 0] = arg.ptr;
+                os.argv[new_argc + 1] = getCmdlineOption(&arg_index);
+                os.argv[new_argc + 2] = getCmdlineOption(&arg_index);
+                new_argc += 3;
+            } else if (std.mem.eql(u8, arg, "--tmpfs")) {
+                os.argv[new_argc + 0] = arg.ptr;
+                os.argv[new_argc + 1] = getCmdlineOption(&arg_index);
+                new_argc += 2;
             } else if (std.mem.eql(u8, arg, "--keep-rw")) {
                 opt.keep_readwrite = true;
             } else if (std.mem.eql(u8, arg, "--start-mount-opt")) {
@@ -63,7 +71,7 @@ pub fn main() !void {
             } else if (std.mem.eql(u8, arg, "--end-mount-opt")) {
                 if (mount_options_list.items.len == 0) {
                     std.log.err("got --end-mount-opt without a corresponding --start-mount-opt", .{});
-                    os.exit(0xff);
+                    posix.exit(0xff);
                 }
                 mount_options_list.items[mount_options_list.items.len - 1].end = new_argc - 1;
             } else if (std.mem.eql(u8, arg, "--tmp-sysroot")) {
@@ -77,15 +85,15 @@ pub fn main() !void {
 
     if (new_argc <= 1) {
         try usage();
-        os.exit(0xff);
+        posix.exit(0xff);
     }
     const next_argv = opt.next_argv orelse {
         std.log.err("missing '--' to delineate a command to execute", .{});
-        os.exit(0xff);
+        posix.exit(0xff);
     };
     const next_program = next_argv[0] orelse {
         std.log.err("missing program after '--'", .{});
-        os.exit(0xff);
+        posix.exit(0xff);
     };
     const sysroot_paths = os.argv[1..new_argc];
     const sysroot_path = opt.tmp_sysroot orelse pickSysrootMount(sysroot_paths);
@@ -96,11 +104,11 @@ pub fn main() !void {
     std.log.info("PreUnshare Gids: {}", .{pre_unshare_gids});
 
     // NEWPID might be necessary for mounting /proc in some cases
-    switch (os.errno(os.linux.unshare(os.linux.CLONE.NEWUSER | os.linux.CLONE.NEWNS))) {
+    switch (posix.errno(os.linux.unshare(os.linux.CLONE.NEWUSER | os.linux.CLONE.NEWNS))) {
         .SUCCESS => {},
         else => |e| {
             std.log.err("unshare failed, errno={}", .{e});
-            os.exit(0xff);
+            posix.exit(0xff);
         },
     }
     {
@@ -108,18 +116,18 @@ pub fn main() !void {
         std.log.info("PostUnshare Uids: {}", .{uids});
     }
     {
-        var fd = try os.open("/proc/self/setgroups", os.O.WRONLY, 0);
-        defer os.close(fd);
+        const fd = try posix.open("/proc/self/setgroups", .{ .ACCMODE = .WRONLY}, 0);
+        defer posix.close(fd);
         const content = "deny";
-        const written = try os.write(fd, content);
+        const written = try posix.write(fd, content);
         std.debug.assert(written == content.len);
     }
     {
-        var fd = try os.open("/proc/self/uid_map", os.O.WRONLY, 0);
-        defer os.close(fd);
+        const fd = try posix.open("/proc/self/uid_map", .{ .ACCMODE = .WRONLY}, 0);
+        defer posix.close(fd);
         var buf: [200]u8 = undefined;
         const content = try std.fmt.bufPrint(&buf, "{} {0} 1", .{pre_unshare_uids.real});
-        const written = try os.write(fd, content);
+        const written = try posix.write(fd, content);
         std.debug.assert(written == content.len);
     }
     {
@@ -127,52 +135,157 @@ pub fn main() !void {
         std.log.info("PostSetUidMap Uids: {}", .{uids});
     }
     {
-        var fd = try os.open("/proc/self/gid_map", os.O.WRONLY, 0);
-        defer os.close(fd);
+        const fd = try posix.open("/proc/self/gid_map", .{ .ACCMODE = .WRONLY}, 0);
+        defer posix.close(fd);
         var buf: [200]u8 = undefined;
         const content = try std.fmt.bufPrint(&buf, "0 {} 1", .{pre_unshare_gids.real});
-        const written = try os.write(fd, content);
+        const written = try posix.write(fd, content);
         std.debug.assert(written == content.len);
     }
 
     std.log.info("marking all mounts as private", .{});
-    switch (os.errno(os.linux.mount("none", "/", null, os.linux.MS.REC | os.linux.MS.PRIVATE, 0))) {
+    switch (posix.errno(os.linux.mount("none", "/", null, os.linux.MS.REC | os.linux.MS.PRIVATE, 0))) {
         .SUCCESS => {},
         else => |errno| {
             std.log.err("mount failed with E{s}", .{@tagName(errno)});
-            os.exit(0xff);
+            posix.exit(0xff);
         },
     }
 
     std.log.info("mounting the new sysroot as a tmpfs to '{s}'", .{sysroot_path});
-    switch (os.errno(os.linux.mount("none", sysroot_path, "tmpfs", 0, 0))) {
+    switch (posix.errno(os.linux.mount("none", sysroot_path, "tmpfs", 0, 0))) {
         .SUCCESS => {},
         else => |errno| {
             std.log.err("mount failed with E{s}", .{@tagName(errno)});
-            os.exit(0xff);
+            posix.exit(0xff);
         },
     }
 
     //try shell("sh");
     var mount_option_index: usize = 0;
 
-    for (sysroot_paths, 0..) |path_ptr, path_index| {
+    var path_index: usize = 0;
+    while (path_index < sysroot_paths.len) : (path_index += 1) {
+        const path_ptr = sysroot_paths[path_index];
+        const path = std.mem.span(path_ptr);
+        if (std.mem.eql(u8, path, "--link")) {
+            const to = std.mem.span(sysroot_paths[path_index + 1]);
+            const from = std.mem.span(sysroot_paths[path_index + 2]);
+            path_index += 2;
+            std.log.info("ln -s '{s}' '{s}'", .{ to, from });
+            var from_path_buf: [std.fs.MAX_PATH_BYTES + 1]u8 = undefined;
+            const from_path = try std.fmt.bufPrintZ(&from_path_buf, "{s}{s}", .{ sysroot_path, from });
+            if (std.fs.path.dirname(from_path)) |from_dir| {
+                try std.fs.cwd().makePath(from_dir);
+            }
+            switch (posix.errno(os.linux.symlink(to, from_path))) {
+                .SUCCESS => {},
+                else => |errno| {
+                    std.log.err("symlink from '{s}' to '{s}' failed, errno={}", .{ from_path, to, errno });
+                    posix.exit(0xff);
+                },
+            }
+            continue;
+        }
+
+        if (std.mem.eql(u8, path, "--bind-mount-host")) {
+            const src = std.mem.span(sysroot_paths[path_index + 1]);
+            const dst_sysroot_relative = std.mem.span(sysroot_paths[path_index + 2]);
+            path_index += 2;
+
+            if (!std.mem.startsWith(u8, dst_sysroot_relative, "/")) {
+                std.log.err("both paths in --bind-mount-host must be absolute but dst is '{s}'", .{dst_sysroot_relative});
+                posix.exit(0xff);
+            }
+
+            var dst_sysroot_buf: [std.fs.MAX_PATH_BYTES + 1]u8 = undefined;
+            const dst_sysroot = try std.fmt.bufPrintZ(&dst_sysroot_buf, "{s}{s}", .{ sysroot_path, dst_sysroot_relative });
+            std.log.info("mkdir -p '{s}'", .{dst_sysroot});
+            try std.fs.cwd().makePath(dst_sysroot);
+
+            const opt_mount_options = getMountOptions(
+                mount_options_list,
+                &mount_option_index,
+                path_index,
+            );
+            if (opt_mount_options) |mount_options| {
+                std.log.info("mount --bind '{s}' to '{s}' with options '{s}'", .{ src, dst_sysroot, mount_options.cmdline_str });
+            } else {
+                std.log.info("mount --bind '{s}' to '{s}'", .{ src, dst_sysroot });
+            }
+
+            var flags: u32 = os.linux.MS.BIND;
+            var mount_data: ?[*:0]const u8 = null;
+            if (opt_mount_options) |mount_options| {
+                flags |= mount_options.flags;
+                mount_data = mount_options.data;
+            }
+            switch (posix.errno(os.linux.mount(src, dst_sysroot, mount_data, flags, 0))) {
+                .SUCCESS => {},
+                else => |errno| {
+                    std.log.err("mount failed with E{s}", .{@tagName(errno)});
+                    posix.exit(0xff);
+                },
+            }
+            continue;
+        }
+
+        if (std.mem.eql(u8, path, "--tmpfs")) {
+            const tmpfs_cmdline = std.mem.span(sysroot_paths[path_index + 1]);
+            path_index += 1;
+            if (!std.mem.startsWith(u8, tmpfs_cmdline, "/")) {
+                std.log.err("both paths in --bind-mount-host must be absolute but dst is '{s}'", .{tmpfs_cmdline});
+                posix.exit(0xff);
+            }
+            var tmpfs_path_buf: [std.fs.MAX_PATH_BYTES + 1]u8 = undefined;
+            const tmpfs_path = try std.fmt.bufPrintZ(&tmpfs_path_buf, "{s}{s}", .{ sysroot_path, tmpfs_cmdline });
+            std.log.info("mkdir -p '{s}'", .{tmpfs_path});
+            try std.fs.cwd().makePath(tmpfs_path);
+
+            const opt_mount_options = getMountOptions(
+                mount_options_list,
+                &mount_option_index,
+                path_index,
+            );
+            if (opt_mount_options) |mount_options| {
+                std.log.info("mounting tmpfs '{s}' with options '{s}'", .{tmpfs_path, mount_options.cmdline_str});
+            } else {
+                std.log.info("mounting tmpfs '{s}'", .{tmpfs_path});
+            }
+
+            var flags: u32 = 0;
+            var mount_data: ?[*:0]const u8 = null;
+            if (opt_mount_options) |mount_options| {
+                flags |= mount_options.flags;
+                mount_data = mount_options.data;
+            }
+            switch (posix.errno(os.linux.mount("none", tmpfs_path, "tmpfs", flags, 0))) {
+                .SUCCESS => {},
+                else => |errno| {
+                    std.log.err("mount tmpfs failed with E{s}", .{@tagName(errno)});
+                    posix.exit(0xff);
+                },
+            }
+
+            continue;
+        }
+
+
         var stat: os.linux.Stat = undefined;
-        switch (os.errno(os.linux.stat(path_ptr, &stat))) {
+        switch (posix.errno(os.linux.stat(path_ptr, &stat))) {
             .SUCCESS => {},
             else => |errno| {
                 std.log.err("stat '{s}' failed with E{s}", .{ path_ptr, @tagName(errno) });
-                os.exit(0xff);
+                posix.exit(0xff);
             },
         }
 
-        const path = std.mem.span(path_ptr);
         var path_in_sysroot_buf: [std.fs.MAX_PATH_BYTES]u8 = undefined;
         const path_in_sysroot = blk: {
             if (std.mem.startsWith(u8, path, "/"))
                 break :blk try std.fmt.bufPrintZ(&path_in_sysroot_buf, "{s}{s}", .{ sysroot_path, path });
             var cwd_buf: [std.fs.MAX_PATH_BYTES]u8 = undefined;
-            const cwd = try std.os.getcwd(&cwd_buf);
+            const cwd = try posix.getcwd(&cwd_buf);
             if (std.mem.eql(u8, path, ".")) {
                 break :blk try std.fmt.bufPrintZ(&path_in_sysroot_buf, "{s}{s}", .{ sysroot_path, cwd });
             }
@@ -192,34 +305,25 @@ pub fn main() !void {
             var buf: [std.mem.page_size]u8 = undefined;
             var total_copied: u64 = 0;
             while (true) {
-                const len = try os.read(src_file.handle, &buf);
+                const len = try posix.read(src_file.handle, &buf);
                 if (len == 0) break;
                 try dst_file.writer().writeAll(buf[0..len]);
                 total_copied += len;
             }
             std.log.info("copied {} bytes", .{total_copied});
-            try os.fchmod(dst_file.handle, stat.mode);
+            try posix.fchmod(dst_file.handle, stat.mode);
         } else if ((stat.mode & os.linux.S.IFDIR) != 0) {
             std.log.info("mkdir -p '{s}'", .{path_in_sysroot});
             std.fs.cwd().makePath(path_in_sysroot) catch |err| {
                 std.log.err("mkdir -p '{s}' failed with {s}", .{path_in_sysroot, @errorName(err)});
-                os.exit(0xff);
+                posix.exit(0xff);
             };
 
-            var opt_mount_options: ?*MountOptions = null;
-            while (true) {
-                if (mount_option_index == mount_options_list.items.len) break;
-                const current = &mount_options_list.items[mount_option_index];
-                if (path_index < current.start) break;
-                if (current.end) |end| {
-                    if (path_index >= end) {
-                        mount_option_index += 1;
-                        continue;
-                    }
-                }
-                opt_mount_options = current;
-                break;
-            }
+            const opt_mount_options = getMountOptions(
+                mount_options_list,
+                &mount_option_index,
+                path_index,
+            );
 
             if (opt_mount_options) |mount_options| {
                 std.log.info("mount --bind '{s}' to '{s}' with options '{s}'", .{ path, path_in_sysroot, mount_options.cmdline_str });
@@ -234,37 +338,37 @@ pub fn main() !void {
                 mount_data = mount_options.data;
             }
 
-            switch (os.errno(os.linux.mount(path, path_in_sysroot, mount_data, flags, 0))) {
+            switch (posix.errno(os.linux.mount(path, path_in_sysroot, mount_data, flags, 0))) {
                 .SUCCESS => {},
                 else => |errno| {
                     // for some reason I can bind mount /proc on my NixOS machine but not my Ubuntu machine?
                     if (std.mem.eql(u8, path, "/proc")) {
                         std.log.warn("failed to bind mount /proc with E{s}, gonna try to mount it directly", .{@tagName(errno)});
-                        switch (os.errno(os.linux.mount("none", "/proc", null, os.linux.MS.PRIVATE | os.linux.MS.REC, 0))) {
+                        switch (posix.errno(os.linux.mount("none", "/proc", null, os.linux.MS.PRIVATE | os.linux.MS.REC, 0))) {
                             .SUCCESS => {},
                             else => |errno2| {
                                 std.log.warn("failed to mount it directly(at 0) also with E{s}", .{@tagName(errno2)});
                                 try shell("sh");
-                                os.exit(0xff);
+                                posix.exit(0xff);
                             },
                         }
-                        switch (os.errno(os.linux.mount("proc", path_in_sysroot, "proc", os.linux.MS.NOSUID | os.linux.MS.NOEXEC | os.linux.MS.NODEV, 0))) {
+                        switch (posix.errno(os.linux.mount("proc", path_in_sysroot, "proc", os.linux.MS.NOSUID | os.linux.MS.NOEXEC | os.linux.MS.NODEV, 0))) {
                             .SUCCESS => {},
                             else => |errno2| {
                                 std.log.warn("failed to mount it directly(at 1) also with E{s}", .{@tagName(errno2)});
                                 try shell("sh");
-                                os.exit(0xff);
+                                posix.exit(0xff);
                             },
                         }
                         continue;
                     }
                     std.log.err("mount '{s}' to '{s}' flags=0x{x} failed, errno=E{s}", .{path, path_in_sysroot, flags, @tagName(errno)});
-                    os.exit(0xff);
+                    posix.exit(0xff);
                 },
             }
         } else {
             std.log.err("unknown file type 0x{x}", .{stat.mode & os.linux.S.IFMT});
-            os.exit(0xff);
+            posix.exit(0xff);
         }
     }
 
@@ -278,50 +382,34 @@ pub fn main() !void {
         try std.fs.cwd().makePath(sysroot_cwd_path);
     }
 
-    for (links.items) |link| {
-        std.log.info("ln -s '{s}' '{s}'", .{ std.mem.span(link.to), link.from });
-        var from_path_buf: [std.fs.MAX_PATH_BYTES + 1]u8 = undefined;
-        const from_path = try std.fmt.bufPrintZ(&from_path_buf, "{s}{s}", .{ sysroot_path, link.from });
-        if (std.fs.path.dirname(from_path)) |from_dir| {
-            try std.fs.cwd().makePath(from_dir);
-        }
-        switch (os.errno(os.linux.symlink(link.to, from_path))) {
-            .SUCCESS => {},
-            else => |errno| {
-                std.log.err("symlink from '{s}' to '{s}' failed, errno={}", .{ from_path, std.mem.span(link.to), errno });
-                os.exit(0xff);
-            },
-        }
-    }
-
     // TODO: make an option to disable this for debugging purposes and such
     //       we might be able to do this after chrooting
     if (opt.keep_readwrite) {
         std.log.warn("keeping veil root writable", .{});
     } else {
         std.log.info("remounting veil root as readonly...", .{});
-        switch (os.errno(os.linux.mount("none", sysroot_path, null, os.linux.MS.REMOUNT | os.linux.MS.RDONLY, 0))) {
+        switch (posix.errno(os.linux.mount("none", sysroot_path, null, os.linux.MS.REMOUNT | os.linux.MS.RDONLY, 0))) {
             .SUCCESS => {},
             else => |errno| {
                 std.log.err("remount viel root as readonly failed with E{s}", .{@tagName(errno)});
-                os.exit(0xff);
+                posix.exit(0xff);
             },
         }
     }
 
     //try shell();
 
-    switch (os.errno(os.linux.chroot(sysroot_path))) {
+    switch (posix.errno(os.linux.chroot(sysroot_path))) {
         .SUCCESS => {},
         else => |errno| {
             std.log.err("chroot '{s}' failed, errno={}", .{ sysroot_path, errno });
-            os.exit(0xff);
+            posix.exit(0xff);
         },
     }
     std.log.info("chroot successful!", .{});
 
     std.log.info("cd '{s}'", .{cwd_path});
-    try os.chdirZ(@ptrCast(cwd_path));
+    try posix.chdirZ(@ptrCast(cwd_path));
 
     std.log.info("execve '{s}'", .{next_program});
     const errno = os.linux.execve(
@@ -330,7 +418,26 @@ pub fn main() !void {
         @ptrCast(os.environ.ptr),
     );
     std.log.err("execve failed, errno={}", .{errno});
-    os.exit(0xff);
+    posix.exit(0xff);
+}
+
+fn getMountOptions(
+    mount_options_list: std.ArrayListUnmanaged(MountOptions),
+    mount_option_index: *usize,
+    path_index: usize,
+) ?*MountOptions {
+    while (true) {
+        if (mount_option_index.* == mount_options_list.items.len) return null;
+        const current = &mount_options_list.items[mount_option_index.*];
+        if (path_index < current.start) return null;
+        if (current.end) |end| {
+            if (path_index >= end) {
+                mount_option_index.* += 1;
+                continue;
+            }
+        }
+        return current;
+    }
 }
 
 const MountOptions = struct {
@@ -357,7 +464,7 @@ const MountOptions = struct {
                 flags |= os.linux.MS.REC;
             } else {
                 std.log.err("unknown mount option '{s}'", .{opt_str});
-                os.exit(0xff);
+                posix.exit(0xff);
             }
         }
 
@@ -371,11 +478,11 @@ const MountOptions = struct {
 };
 
 fn shell(name: []const u8) !void {
-    var child = std.ChildProcess.init(&[_][]const u8{name}, std.heap.page_allocator);
+    var child = std.process.Child.init(&[_][]const u8{name}, std.heap.page_allocator);
     try child.spawn();
     const result = try child.wait();
     std.log.info("shell exited with {}", .{result});
-    os.exit(0);
+    posix.exit(0);
 }
 
 //fn sysrootMountIsOk(sysroot_paths: []const [*:0]const u8, sysroot_path: []const u8) bool {
@@ -399,13 +506,13 @@ fn pickSysrootMount(sysroot_paths: anytype) [:0]const u8 {
         if (sysrootMountIsOk(sysroot_paths, "/tmp")) return "/tmp";
     } else |_| { }
     std.log.err("neither /mnt not /tmp can be used, TODO: maybe make a directory underneath /tmp?", .{});
-    os.exit(0xff);
+    posix.exit(0xff);
 }
 
 const Ids = struct {
-    real: os.uid_t,
-    effective: os.uid_t,
-    saved: os.uid_t,
+    real: posix.uid_t,
+    effective: posix.uid_t,
+    saved: posix.uid_t,
 
     pub fn isSuid(self: Ids) bool {
         return self.real != self.effective or self.real != self.saved;
@@ -414,11 +521,11 @@ const Ids = struct {
 
 fn getUids() Ids {
     var ids: Ids = undefined;
-    switch (os.errno(os.linux.getresuid(&ids.real, &ids.effective, &ids.saved))) {
+    switch (posix.errno(os.linux.getresuid(&ids.real, &ids.effective, &ids.saved))) {
         .SUCCESS => {},
         else => |errno| {
             std.log.err("getresuid failed, errno={}", .{errno});
-            os.exit(0xff);
+            posix.exit(0xff);
         },
     }
     return ids;
@@ -426,11 +533,11 @@ fn getUids() Ids {
 
 fn getGids() Ids {
     var ids: Ids = undefined;
-    switch (os.errno(os.linux.getresgid(&ids.real, &ids.effective, &ids.saved))) {
+    switch (posix.errno(os.linux.getresgid(&ids.real, &ids.effective, &ids.saved))) {
         .SUCCESS => {},
         else => |errno| {
             std.log.err("getresgid failed, errno={}", .{errno});
-            os.exit(0xff);
+            posix.exit(0xff);
         },
     }
     return ids;
