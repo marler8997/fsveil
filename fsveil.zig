@@ -116,14 +116,14 @@ pub fn main() !void {
         std.log.info("PostUnshare Uids: {}", .{uids});
     }
     {
-        const fd = try posix.open("/proc/self/setgroups", .{ .ACCMODE = .WRONLY}, 0);
+        const fd = try posix.open("/proc/self/setgroups", .{ .ACCMODE = .WRONLY }, 0);
         defer posix.close(fd);
         const content = "deny";
         const written = try posix.write(fd, content);
         std.debug.assert(written == content.len);
     }
     {
-        const fd = try posix.open("/proc/self/uid_map", .{ .ACCMODE = .WRONLY}, 0);
+        const fd = try posix.open("/proc/self/uid_map", .{ .ACCMODE = .WRONLY }, 0);
         defer posix.close(fd);
         var buf: [200]u8 = undefined;
         const content = try std.fmt.bufPrint(&buf, "{} {0} 1", .{pre_unshare_uids.real});
@@ -135,7 +135,7 @@ pub fn main() !void {
         std.log.info("PostSetUidMap Uids: {}", .{uids});
     }
     {
-        const fd = try posix.open("/proc/self/gid_map", .{ .ACCMODE = .WRONLY}, 0);
+        const fd = try posix.open("/proc/self/gid_map", .{ .ACCMODE = .WRONLY }, 0);
         defer posix.close(fd);
         var buf: [200]u8 = undefined;
         const content = try std.fmt.bufPrint(&buf, "0 {} 1", .{pre_unshare_gids.real});
@@ -173,7 +173,7 @@ pub fn main() !void {
             const from = std.mem.span(sysroot_paths[path_index + 2]);
             path_index += 2;
             std.log.info("ln -s '{s}' '{s}'", .{ to, from });
-            var from_path_buf: [std.fs.MAX_PATH_BYTES + 1]u8 = undefined;
+            var from_path_buf: [std.fs.max_path_bytes + 1]u8 = undefined;
             const from_path = try std.fmt.bufPrintZ(&from_path_buf, "{s}{s}", .{ sysroot_path, from });
             if (std.fs.path.dirname(from_path)) |from_dir| {
                 try std.fs.cwd().makePath(from_dir);
@@ -198,7 +198,7 @@ pub fn main() !void {
                 posix.exit(0xff);
             }
 
-            var dst_sysroot_buf: [std.fs.MAX_PATH_BYTES + 1]u8 = undefined;
+            var dst_sysroot_buf: [std.fs.max_path_bytes + 1]u8 = undefined;
             const dst_sysroot = try std.fmt.bufPrintZ(&dst_sysroot_buf, "{s}{s}", .{ sysroot_path, dst_sysroot_relative });
             std.log.info("mkdir -p '{s}'", .{dst_sysroot});
             try std.fs.cwd().makePath(dst_sysroot);
@@ -237,7 +237,7 @@ pub fn main() !void {
                 std.log.err("both paths in --bind-mount-host must be absolute but dst is '{s}'", .{tmpfs_cmdline});
                 posix.exit(0xff);
             }
-            var tmpfs_path_buf: [std.fs.MAX_PATH_BYTES + 1]u8 = undefined;
+            var tmpfs_path_buf: [std.fs.max_path_bytes + 1]u8 = undefined;
             const tmpfs_path = try std.fmt.bufPrintZ(&tmpfs_path_buf, "{s}{s}", .{ sysroot_path, tmpfs_cmdline });
             std.log.info("mkdir -p '{s}'", .{tmpfs_path});
             try std.fs.cwd().makePath(tmpfs_path);
@@ -248,7 +248,7 @@ pub fn main() !void {
                 path_index,
             );
             if (opt_mount_options) |mount_options| {
-                std.log.info("mounting tmpfs '{s}' with options '{s}'", .{tmpfs_path, mount_options.cmdline_str});
+                std.log.info("mounting tmpfs '{s}' with options '{s}'", .{ tmpfs_path, mount_options.cmdline_str });
             } else {
                 std.log.info("mounting tmpfs '{s}'", .{tmpfs_path});
             }
@@ -270,7 +270,6 @@ pub fn main() !void {
             continue;
         }
 
-
         var stat: os.linux.Stat = undefined;
         switch (posix.errno(os.linux.stat(path_ptr, &stat))) {
             .SUCCESS => {},
@@ -280,11 +279,11 @@ pub fn main() !void {
             },
         }
 
-        var path_in_sysroot_buf: [std.fs.MAX_PATH_BYTES]u8 = undefined;
+        var path_in_sysroot_buf: [std.fs.max_path_bytes]u8 = undefined;
         const path_in_sysroot = blk: {
             if (std.mem.startsWith(u8, path, "/"))
                 break :blk try std.fmt.bufPrintZ(&path_in_sysroot_buf, "{s}{s}", .{ sysroot_path, path });
-            var cwd_buf: [std.fs.MAX_PATH_BYTES]u8 = undefined;
+            var cwd_buf: [std.fs.max_path_bytes]u8 = undefined;
             const cwd = try posix.getcwd(&cwd_buf);
             if (std.mem.eql(u8, path, ".")) {
                 break :blk try std.fmt.bufPrintZ(&path_in_sysroot_buf, "{s}{s}", .{ sysroot_path, cwd });
@@ -315,7 +314,7 @@ pub fn main() !void {
         } else if ((stat.mode & os.linux.S.IFDIR) != 0) {
             std.log.info("mkdir -p '{s}'", .{path_in_sysroot});
             std.fs.cwd().makePath(path_in_sysroot) catch |err| {
-                std.log.err("mkdir -p '{s}' failed with {s}", .{path_in_sysroot, @errorName(err)});
+                std.log.err("mkdir -p '{s}' failed with {s}", .{ path_in_sysroot, @errorName(err) });
                 posix.exit(0xff);
             };
 
@@ -362,7 +361,7 @@ pub fn main() !void {
                         }
                         continue;
                     }
-                    std.log.err("mount '{s}' to '{s}' flags=0x{x} failed, errno=E{s}", .{path, path_in_sysroot, flags, @tagName(errno)});
+                    std.log.err("mount '{s}' to '{s}' flags=0x{x} failed, errno=E{s}", .{ path, path_in_sysroot, flags, @tagName(errno) });
                     posix.exit(0xff);
                 },
             }
@@ -372,11 +371,11 @@ pub fn main() !void {
         }
     }
 
-    var cwd_path_buf: [std.fs.MAX_PATH_BYTES + 1]u8 = undefined;
+    var cwd_path_buf: [std.fs.max_path_bytes + 1]u8 = undefined;
     const cwd_path = try std.process.getCwd(cwd_path_buf[0 .. cwd_path_buf.len - 1]);
     cwd_path_buf[cwd_path.len] = 0;
     {
-        var sysroot_cwd_path_buf: [std.fs.MAX_PATH_BYTES]u8 = undefined;
+        var sysroot_cwd_path_buf: [std.fs.max_path_bytes]u8 = undefined;
         const sysroot_cwd_path = try std.fmt.bufPrintZ(&sysroot_cwd_path_buf, "{s}{s}", .{ sysroot_path, cwd_path });
         std.log.info("creating {s}...", .{sysroot_cwd_path});
         try std.fs.cwd().makePath(sysroot_cwd_path);
@@ -450,7 +449,7 @@ const MountOptions = struct {
         const cmdline_str = std.mem.span(cmdline_str_ptr);
         var flags: u32 = 0;
 
-        var it = std.mem.split(u8, cmdline_str, ",");
+        var it = std.mem.splitScalar(u8, cmdline_str, ',');
         while (it.next()) |opt_str| {
             if (std.mem.eql(u8, opt_str, "nosuid")) {
                 flags |= os.linux.MS.NOSUID;
@@ -501,10 +500,10 @@ fn sysrootMountIsOk(sysroot_paths: anytype, sysroot_path: []const u8) bool {
 fn pickSysrootMount(sysroot_paths: anytype) [:0]const u8 {
     if (std.fs.accessAbsolute("/mnt", .{})) {
         if (sysrootMountIsOk(sysroot_paths, "/mnt")) return "/mnt";
-    } else |_| { }
+    } else |_| {}
     if (std.fs.accessAbsolute("/tmp", .{})) {
         if (sysrootMountIsOk(sysroot_paths, "/tmp")) return "/tmp";
-    } else |_| { }
+    } else |_| {}
     std.log.err("neither /mnt not /tmp can be used, TODO: maybe make a directory underneath /tmp?", .{});
     posix.exit(0xff);
 }
