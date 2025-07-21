@@ -301,7 +301,7 @@ pub fn main() !void {
             defer src_file.close();
             var dst_file = try std.fs.cwd().createFile(path_in_sysroot, .{});
             defer dst_file.close();
-            var buf: [std.mem.page_size]u8 = undefined;
+            var buf: [@max(std.heap.page_size_min, 4096)]u8 = undefined;
             var total_copied: u64 = 0;
             while (true) {
                 const len = try posix.read(src_file.handle, &buf);
