@@ -115,6 +115,11 @@ pub fn main() !void {
         const uids = getUids();
         std.log.info("PostUnshare Uids: {}", .{uids});
     }
+
+    // on some systems you need to call setgroups before setting uid_map and guid_map
+    // but on others you need to call it after.
+    const setgroups_error = setgroups();
+
     {
         const fd = try posix.open("/proc/self/uid_map", .{ .ACCMODE = .WRONLY }, 0);
         defer posix.close(fd);
@@ -135,13 +140,9 @@ pub fn main() !void {
         const written = try posix.write(fd, content);
         std.debug.assert(written == content.len);
     }
-    {
-        const fd = posix.open("/proc/self/setgroups", .{ .ACCMODE = .WRONLY }, 0) catch |err| @panic(@errorName(err));
-        defer posix.close(fd);
-        const content = "deny";
-        const written = try posix.write(fd, content);
-        std.debug.assert(written == content.len);
-    }
+
+    // now try calling setgroups if the first one failed
+    setgroups_error catch try setgroups();
 
     std.log.info("marking all mounts as private", .{});
     switch (posix.errno(os.linux.mount("none", "/", null, os.linux.MS.REC | os.linux.MS.PRIVATE, 0))) {
@@ -418,6 +419,14 @@ pub fn main() !void {
     );
     std.log.err("execve failed, errno={}", .{errno});
     posix.exit(0xff);
+}
+
+fn setgroups() !void {
+    const fd = try posix.open("/proc/self/setgroups", .{ .ACCMODE = .WRONLY }, 0);
+    defer posix.close(fd);
+    const content = "deny";
+    const written = try posix.write(fd, content);
+    std.debug.assert(written == content.len);
 }
 
 fn getMountOptions(
