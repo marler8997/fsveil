@@ -116,13 +116,6 @@ pub fn main() !void {
         std.log.info("PostUnshare Uids: {}", .{uids});
     }
     {
-        const fd = try posix.open("/proc/self/setgroups", .{ .ACCMODE = .WRONLY }, 0);
-        defer posix.close(fd);
-        const content = "deny";
-        const written = try posix.write(fd, content);
-        std.debug.assert(written == content.len);
-    }
-    {
         const fd = try posix.open("/proc/self/uid_map", .{ .ACCMODE = .WRONLY }, 0);
         defer posix.close(fd);
         var buf: [200]u8 = undefined;
@@ -139,6 +132,13 @@ pub fn main() !void {
         defer posix.close(fd);
         var buf: [200]u8 = undefined;
         const content = try std.fmt.bufPrint(&buf, "0 {} 1", .{pre_unshare_gids.real});
+        const written = try posix.write(fd, content);
+        std.debug.assert(written == content.len);
+    }
+    {
+        const fd = posix.open("/proc/self/setgroups", .{ .ACCMODE = .WRONLY }, 0) catch |err| @panic(@errorName(err));
+        defer posix.close(fd);
+        const content = "deny";
         const written = try posix.write(fd, content);
         std.debug.assert(written == content.len);
     }
