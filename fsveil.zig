@@ -4,8 +4,10 @@ const posix = std.posix;
 
 pub const log_level: std.log.Level = .warn;
 
+const zig_atleast_15 = @import("builtin").zig_version.order(.{ .major = 0, .minor = 15, .patch = 0 }) != .lt;
+
 fn usage() !void {
-    try std.io.getStdErr().writer().writeAll(
+    const str =
         \\fsveil: Runs the given program with a veiled view of the filesystem
         \\
         \\Usage: fsveil [OPTIONS...] FILES/DIRS -- CMD...
@@ -19,7 +21,13 @@ fn usage() !void {
         \\    --keep-rw                                 Don't remount the veil as readonly
         \\    --tmp-sysroot PATH                        Override the default sysroot mount path (i.e. /mnt or /tmp)
         \\
-    );
+    ;
+    if (zig_atleast_15) {
+        var stderr_writer = std.fs.File.stderr().writer(&.{});
+        stderr_writer.interface.writeAll(str) catch return stderr_writer.err orelse error.Unexpected;
+    } else {
+        try std.io.getStdErr().writer().writeAll(str);
+    }
 }
 
 var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
@@ -302,14 +310,7 @@ pub fn main() !void {
             defer src_file.close();
             var dst_file = try std.fs.cwd().createFile(path_in_sysroot, .{});
             defer dst_file.close();
-            var buf: [@max(std.heap.page_size_min, 4096)]u8 = undefined;
-            var total_copied: u64 = 0;
-            while (true) {
-                const len = try posix.read(src_file.handle, &buf);
-                if (len == 0) break;
-                try dst_file.writer().writeAll(buf[0..len]);
-                total_copied += len;
-            }
+            const total_copied = try copyFileToSysroot(src_file, dst_file);
             std.log.info("copied {} bytes", .{total_copied});
             try posix.fchmod(dst_file.handle, stat.mode);
         } else if ((stat.mode & os.linux.S.IFDIR) != 0) {
@@ -419,6 +420,33 @@ pub fn main() !void {
     );
     std.log.err("execve failed, errno={}", .{errno});
     posix.exit(0xff);
+}
+
+fn copyFileToSysroot(src_file: std.fs.File, dst_file: std.fs.File) !u64 {
+    var total_copied: u64 = 0;
+    if (zig_atleast_15) {
+        var read_buf: [0]u8 = undefined;
+        var reader = src_file.reader(&read_buf);
+        var write_buf: [@max(std.heap.page_size_min, 4096)]u8 = undefined;
+        var writer = dst_file.writer(&write_buf);
+        while (true) {
+            _ = reader.interface.stream(&writer.interface, .unlimited) catch |err| switch (err) {
+                error.EndOfStream => break,
+                error.ReadFailed => return reader.err orelse error.Unexpected,
+                error.WriteFailed => return writer.err orelse error.Unexpected,
+            };
+        }
+        writer.interface.flush() catch return writer.err orelse error.Unexpected;
+    } else {
+        var buf: [@max(std.heap.page_size_min, 4096)]u8 = undefined;
+        while (true) {
+            const len = try posix.read(src_file.handle, &buf);
+            if (len == 0) break;
+            try dst_file.writer().writeAll(buf[0..len]);
+            total_copied += len;
+        }
+    }
+    return total_copied;
 }
 
 fn setgroups() !void {
