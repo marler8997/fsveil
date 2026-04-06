@@ -199,7 +199,7 @@ fn setupSysroot(
             if (std.fs.path.dirname(from_path)) |from_dir| {
                 try std.fs.cwd().makePath(from_dir);
             }
-            switch (posix.errno(os.linux.symlink(to, from_path))) {
+            switch (posix.errno(os.linux.symlinkat(to, os.linux.AT.FDCWD, from_path))) {
                 .SUCCESS => {},
                 else => |errno| {
                     std.log.err("symlink from '{s}' to '{s}' failed, errno={}", .{ from_path, to, errno });
@@ -292,7 +292,7 @@ fn setupSysroot(
         }
 
         var stat: os.linux.Stat = undefined;
-        switch (posix.errno(os.linux.stat(path_ptr, &stat))) {
+        switch (posix.errno(os.linux.fstatat(os.linux.AT.FDCWD, path_ptr, &stat, 0))) {
             .SUCCESS => {},
             else => |errno| {
                 std.log.err("stat '{s}' failed with E{s}", .{ path_ptr, @tagName(errno) });
