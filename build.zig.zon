@@ -2,8 +2,17 @@
     .name = .fsveil,
     .fingerprint = 0x216edced85bb3ac2,
     .version = "0.0.0",
-    .zig_version = "0.15.2",
-    .minimum_zig_version = "0.14.0",
+    .minimum_zig_version = "0.17.0",
+    .dependencies = .{
+        .patch = .{
+            .url = "git+https://github.com/marler8997/zig-patch#c3ad78b305ba03bcd645c0bac004d1719407c6b8",
+            .hash = "patch-0.0.0-WCKjsxixAADfwXQv4Vugyxo6PFbDFuuyM7ly3OiqZRYR",
+        },
+        .staticio = .{
+            .url = "git+https://github.com/marler8997/zig-staticio#757f0f82346dc72821a314716141767f23c93e2d",
+            .hash = "staticio-0.0.0-ypcguFqyAABuHOp5fr9CJs39UchssOB_SEa0TC-p8gwf",
+        },
+    },
     .paths = .{
         "build.zig",
         "build.zig.zon",
