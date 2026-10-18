@@ -18,5 +18,6 @@
         "build.zig.zon",
         "broker.zig",
         "fsveil.zig",
+        "test.zig",
     },
 }
