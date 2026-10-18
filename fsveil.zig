@@ -2,12 +2,11 @@ const std = @import("std");
 const Io = std.Io;
 const linux = std.os.linux;
 
-const broker = @import("broker.zig");
-const Ids = broker.Ids;
-
-pub const log_level: std.log.Level = .warn;
+const veil = @import("veil.zig");
+const Ids = veil.Ids;
 
 pub const std_options: std.Options = .{
+    .log_level = .warn,
     // see build.zig, staticio only compiles the Io operations fsveil reaches
     .io_vtable = .threaded,
     // The default 256 KiB signal stack is threadlocal, zeroing it at startup
@@ -46,7 +45,7 @@ pub fn main(init: std.process.Init.Minimal) !void {
     } else null;
     const veil_args = all_args[0 .. dash_index orelse all_args.len];
 
-    // validate the veil args, the broker iterates them again to do the work
+    // validate the veil args, setupSysroot iterates them again to do the work
     var opt: struct {
         keep_readwrite: bool = false,
         tmp_sysroot: ?[:0]const u8 = null,
@@ -54,7 +53,7 @@ pub fn main(init: std.process.Init.Minimal) !void {
     {
         var entry_count: usize = 0;
         var mount_opt_active = false;
-        var arg_it: broker.ArgIterator = .{ .args = veil_args };
+        var arg_it: veil.ArgIterator = .{ .args = veil_args };
         while (arg_it.next()) |arg| switch (arg) {
             .path, .link, .bind_mount_host, .tmpfs => entry_count += 1,
             .start_mount_opt => {
@@ -95,32 +94,26 @@ pub fn main(init: std.process.Init.Minimal) !void {
     const pre_unshare_gids = getGids();
     std.log.info("PreUnshare Gids: {}", .{pre_unshare_gids});
 
-    try unshare(io, .{
-        .pre_unshare_uids = pre_unshare_uids,
-        .pre_unshare_gids = pre_unshare_gids,
-        .veil_args = veil_args,
-        .sysroot_path = sysroot_path,
-        .keep_readwrite = opt.keep_readwrite,
-    });
+    var cwd_path_buf: [Io.Dir.max_path_bytes + 1]u8 = undefined;
+    const cwd_path_len = try std.process.currentPath(io, cwd_path_buf[0 .. cwd_path_buf.len - 1]);
+    cwd_path_buf[cwd_path_len] = 0;
+    const cwd_path = cwd_path_buf[0..cwd_path_len :0];
 
+    veil.enterNewNamespaces(pre_unshare_uids, pre_unshare_gids);
     {
         const uids = getUids();
         std.log.info("PostUnshare Uids: {}", .{uids});
     }
 
-    // The broker already did chroot. chdir to restore working directory.
-    var cwd_path_buf: [Io.Dir.max_path_bytes + 1]u8 = undefined;
-    const cwd_path_len = try std.process.currentPath(io, cwd_path_buf[0 .. cwd_path_buf.len - 1]);
-    cwd_path_buf[cwd_path_len] = 0;
-    const cwd_path = cwd_path_buf[0..cwd_path_len :0];
-    std.log.info("cd '{s}'", .{cwd_path});
-    switch (linux.errno(linux.chdir(cwd_path))) {
-        .SUCCESS => {},
-        else => |e| {
-            std.log.err("chdir '{s}' failed, errno={}", .{ cwd_path, e });
-            std.process.exit(0xff);
-        },
-    }
+    // entering the mount namespace moved us to its root directory, go back so
+    // relative veil paths resolve against the cwd fsveil was started in
+    chdirOrExit(cwd_path);
+    veil.setupSysroot(io, veil_args, sysroot_path, opt.keep_readwrite) catch |err| {
+        std.log.err("setupSysroot failed: {s}", .{@errorName(err)});
+        std.process.exit(0xff);
+    };
+    // setupSysroot chroots into the sysroot, cwd is still outside of it
+    chdirOrExit(cwd_path);
 
     std.log.info("execve '{s}'", .{next_program});
     const errno = linux.execve(
@@ -132,99 +125,14 @@ pub fn main(init: std.process.Init.Minimal) !void {
     std.process.exit(0xff);
 }
 
-// Set up a new user + mount namespace with uid/gid maps, then set up the
-// sysroot with all mount operations.
-//
-// On systems with AppArmor restricting unprivileged user namespaces (e.g.
-// Ubuntu 24.04+), operations like writing uid/gid maps and mounting are
-// blocked from inside the namespace. We fork a broker child BEFORE unshare;
-// the broker stays outside the namespace and can perform privileged
-// operations by entering the parent's namespaces via setns().
-//
-// Flow:
-//   1. Create eventfd for synchronization
-//   2. Fork broker child
-//   --------------------------------------------------------------------------------
-//     Parent 1. Unshare (NEWUSER|NEWNS)
-//     Parent 2. Write to eventfd to signal unshare is complete
-//     Parent 3. Wait for child to exit
-//   --------------------------------------------------------------------------------
-//     Broker 1. Wait on eventfd (meaning parent finished calling unshare)
-//     Broker 2. Write id maps, enter parent's namespaces, do all mounts, exit.
-fn unshare(io: Io, args: broker.Args) !void {
-    const event_fd: linux.fd_t = blk: {
-        const rc = linux.eventfd(0, linux.EFD.CLOEXEC);
-        break :blk switch (linux.errno(rc)) {
-            .SUCCESS => @intCast(rc),
-            else => |e| {
-                std.log.err("eventfd failed, errno={}", .{e});
-                std.process.exit(0xff);
-            },
-        };
-    };
-    defer broker.closeFd(event_fd);
-    const parent_pid = linux.getpid();
-    const broker_pid: linux.pid_t = blk: {
-        const fork_rc = linux.fork();
-        break :blk switch (linux.errno(fork_rc)) {
-            .SUCCESS => @intCast(fork_rc),
-            else => |e| {
-                std.log.err("fork failed, errno={}", .{e});
-                std.process.exit(0xff);
-            },
-        };
-    };
-    if (broker_pid == 0) return broker.run(io, event_fd, parent_pid, &args);
-
-    switch (linux.errno(linux.unshare(linux.CLONE.NEWUSER | linux.CLONE.NEWNS))) {
+fn chdirOrExit(path: [:0]const u8) void {
+    std.log.info("cd '{s}'", .{path});
+    switch (linux.errno(linux.chdir(path))) {
         .SUCCESS => {},
         else => |e| {
-            std.log.err("unshare failed, errno={}", .{e});
+            std.log.err("chdir '{s}' failed, errno={}", .{ path, e });
             std.process.exit(0xff);
         },
-    }
-
-    // signal broker that we've completed "unshare" by writing to the eventfd.
-    {
-        const value: u64 = 1;
-        const rc = linux.write(event_fd, std.mem.asBytes(&value), @sizeOf(u64));
-        switch (linux.errno(rc)) {
-            .SUCCESS => {},
-            else => |e| {
-                std.log.err("eventfd write failed, errno={}", .{e});
-                std.process.exit(0xff);
-            },
-        }
-        if (rc != @sizeOf(u64)) {
-            std.log.err("eventfd write returned {} bytes, expected {}", .{ rc, @sizeOf(u64) });
-            std.process.exit(0xff);
-        }
-    }
-
-    var status_signed: i32 = undefined;
-    while (true) {
-        switch (linux.errno(linux.waitpid(broker_pid, &status_signed, 0))) {
-            .SUCCESS => break,
-            .INTR => continue,
-            else => |e| {
-                std.log.err("waitpid on broker failed, errno={}", .{e});
-                std.process.exit(0xff);
-            },
-        }
-    }
-    const status: u32 = @bitCast(status_signed);
-    if (linux.W.IFSIGNALED(status)) {
-        std.log.err("broker killed by signal {}", .{linux.W.TERMSIG(status)});
-        std.process.exit(0xff);
-    }
-    if (!linux.W.IFEXITED(status)) {
-        std.log.err("broker exited with unexpected status 0x{x}", .{status});
-        std.process.exit(0xff);
-    }
-    const exit_code = linux.W.EXITSTATUS(status);
-    if (exit_code != 0) {
-        std.log.err("broker exited with status {}", .{exit_code});
-        std.process.exit(exit_code);
     }
 }
 

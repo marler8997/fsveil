@@ -16,7 +16,7 @@
     .paths = .{
         "build.zig",
         "build.zig.zon",
-        "broker.zig",
+        "veil.zig",
         "fsveil.zig",
         "test.zig",
     },

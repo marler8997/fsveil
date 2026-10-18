@@ -14,36 +14,82 @@ pub const Ids = struct {
 
 pub const MountOptions = struct {
     cmdline_str: [:0]const u8,
-    flags: u32,
-    data: ?[*:0]const u8,
-    pub fn init(cmdline_str_ptr: [*:0]const u8) MountOptions {
-        const cmdline_str = std.mem.span(cmdline_str_ptr);
-        var flags: u32 = 0;
+    /// MOUNT_ATTR_* flags for mount_setattr
+    attr_set: u64 = 0,
+    private: bool = false,
+    recursive: bool = false,
 
-        var it = std.mem.splitScalar(u8, cmdline_str, ',');
+    pub fn init(cmdline_str_ptr: [*:0]const u8) MountOptions {
+        var options: MountOptions = .{ .cmdline_str = std.mem.span(cmdline_str_ptr) };
+        var it = std.mem.splitScalar(u8, options.cmdline_str, ',');
         while (it.next()) |opt_str| {
             if (std.mem.eql(u8, opt_str, "nosuid")) {
-                flags |= linux.MS.NOSUID;
+                options.attr_set |= MOUNT_ATTR.NOSUID;
             } else if (std.mem.eql(u8, opt_str, "noexec")) {
-                flags |= linux.MS.NOEXEC;
+                options.attr_set |= MOUNT_ATTR.NOEXEC;
             } else if (std.mem.eql(u8, opt_str, "nodev")) {
-                flags |= linux.MS.NODEV;
+                options.attr_set |= MOUNT_ATTR.NODEV;
             } else if (std.mem.eql(u8, opt_str, "private")) {
-                flags |= linux.MS.PRIVATE;
+                options.private = true;
             } else if (std.mem.eql(u8, opt_str, "recursive")) {
-                flags |= linux.MS.REC;
+                options.recursive = true;
             } else {
                 std.log.err("unknown mount option '{s}'", .{opt_str});
                 std.process.exit(0xff);
             }
         }
-
-        return MountOptions{
-            .cmdline_str = cmdline_str,
-            .flags = flags,
-            .data = null,
-        };
+        return options;
     }
+
+    /// The flags for bind mounting with these options, a recursive bind also
+    /// binds the submounts.
+    fn bindFlags(opt_options: ?MountOptions) u32 {
+        const options = opt_options orelse return linux.MS.BIND;
+        return linux.MS.BIND | @as(u32, if (options.recursive) linux.MS.REC else 0);
+    }
+
+    /// Applies the options to an existing mount. A bind mount ignores flags
+    /// like MS_NOSUID, they only take effect when applied afterwards.
+    /// mount_setattr only adds the flags it's given, so flags the kernel
+    /// locked on the source mount are kept.
+    fn apply(opt_options: ?MountOptions, path: [*:0]const u8) void {
+        const options = opt_options orelse return;
+        var attr: MountAttr = .{
+            .attr_set = options.attr_set,
+            .attr_clr = 0,
+            .propagation = if (options.private) linux.MS.PRIVATE else 0,
+            .userns_fd = 0,
+        };
+        const rc = linux.syscall5(
+            .mount_setattr,
+            @as(usize, @bitCast(@as(isize, linux.AT.FDCWD))),
+            @intFromPtr(path),
+            if (options.recursive) linux.AT.RECURSIVE else 0,
+            @intFromPtr(&attr),
+            @sizeOf(MountAttr),
+        );
+        switch (linux.errno(rc)) {
+            .SUCCESS => {},
+            else => |e| {
+                std.log.err("applying mount options '{s}' to '{s}' failed, errno={}", .{ options.cmdline_str, path, e });
+                std.process.exit(0xff);
+            },
+        }
+    }
+};
+
+// std.os.linux.mount_setattr doesn't take the mount_attr struct, these are
+// from linux/mount.h
+const MountAttr = extern struct {
+    attr_set: u64,
+    attr_clr: u64,
+    propagation: u64,
+    userns_fd: u64,
+};
+const MOUNT_ATTR = struct {
+    const NOSUID = 0x2;
+    const NODEV = 0x4;
+    const NOEXEC = 0x8;
 };
 
 /// A command-line argument before "--" along with its option arguments.
@@ -92,74 +138,170 @@ pub const ArgIterator = struct {
     }
 };
 
-pub const Args = struct {
-    pre_unshare_uids: Ids,
-    pre_unshare_gids: Ids,
-    /// the command-line arguments before "--", already validated by main
-    veil_args: []const [*:0]const u8,
-    sysroot_path: [:0]const u8,
-    keep_readwrite: bool,
-};
-
-pub fn run(
-    io: Io,
-    wait_fd: linux.fd_t,
-    parent_pid: linux.pid_t,
-    args: *const Args,
-) !void {
-    std.log.info("broker: waiting for parent {} to signal eventfd", .{parent_pid});
-
-    {
-        var buf: [8]u8 = undefined;
-        const rc = linux.read(wait_fd, &buf, buf.len);
-        switch (linux.errno(rc)) {
+/// Moves this process into a new user and mount namespace.
+///
+/// On systems with AppArmor restricting unprivileged user namespaces (e.g.
+/// Ubuntu 24.04+), the process that calls unshare(CLONE_NEWUSER) loses its
+/// capabilities, it can't write its own id maps, mount or chroot. A process
+/// that joins the namespace with setns() keeps them. So a short-lived helper
+/// child creates the namespaces and this process joins them.
+///
+/// Flow:
+///   1. Create the ready and done pipes, fork the helper
+///   --------------------------------------------------------------------------
+///     Helper 1. unshare(NEWUSER|NEWNS)
+///     Helper 2. Write a byte to the ready pipe
+///     Helper 3. Read the done pipe until EOF, exit
+///   --------------------------------------------------------------------------
+///     Main 1. Read the ready pipe, EOF means the helper failed
+///     Main 2. Write the helper's setgroups, uid_map and gid_map
+///     Main 3. setns() into the helper's user and mount namespaces
+///     Main 4. Close the done pipe and wait for the helper to exit
+///
+/// A pipe reads EOF when the other process dies, so neither waits forever.
+///
+/// Note that setns(CLONE_NEWNS) also changes the working directory to the
+/// root of the namespace.
+pub fn enterNewNamespaces(uids: Ids, gids: Ids) void {
+    const ready = pipeOrExit();
+    const done = pipeOrExit();
+    const helper_pid: linux.pid_t = blk: {
+        const rc = linux.fork();
+        break :blk switch (linux.errno(rc)) {
+            .SUCCESS => @intCast(rc),
+            else => |e| {
+                std.log.err("fork failed, errno={}", .{e});
+                std.process.exit(0xff);
+            },
+        };
+    };
+    if (helper_pid == 0) {
+        closeFd(ready[0]);
+        closeFd(done[1]);
+        switch (linux.errno(linux.unshare(linux.CLONE.NEWUSER | linux.CLONE.NEWNS))) {
             .SUCCESS => {},
             else => |e| {
-                std.log.err("broker: eventfd read failed, errno={}", .{e});
+                std.log.err("unshare failed, errno={}", .{e});
                 std.process.exit(0xff);
             },
         }
-        if (rc != @sizeOf(u64)) {
-            std.log.err("broker: eventfd read returned {} bytes, expected {}", .{ rc, @sizeOf(u64) });
+        writeOrExit(ready[1], "1", "the ready pipe");
+        var buf: [1]u8 = undefined;
+        if (readOrExit(done[0], &buf, "the done pipe") != 0) {
+            std.log.err("unexpected data on the done pipe", .{});
             std.process.exit(0xff);
         }
+        std.process.exit(0);
     }
-    closeFd(wait_fd);
+    closeFd(ready[1]);
+    closeFd(done[0]);
 
-    // Write the parent's id maps.
+    {
+        var buf: [1]u8 = undefined;
+        if (readOrExit(ready[0], &buf, "the ready pipe") == 0) {
+            // the helper exited without creating the namespaces, it logged why
+            const exit_code = waitHelper(helper_pid);
+            std.process.exit(if (exit_code == 0) 0xff else exit_code);
+        }
+        closeFd(ready[0]);
+    }
+
     {
         var path_buf: [64]u8 = undefined;
-        const sg_path = std.mem.printSentinel(&path_buf, "/proc/{}/setgroups", .{parent_pid}, 0) catch unreachable;
+        const sg_path = std.mem.printSentinel(&path_buf, "/proc/{}/setgroups", .{helper_pid}, 0) catch unreachable;
         writeProcFile(sg_path, "deny");
     }
     {
         var path_buf: [64]u8 = undefined;
-        const uid_path = std.mem.printSentinel(&path_buf, "/proc/{}/uid_map", .{parent_pid}, 0) catch unreachable;
-        writeIdMap(uid_path, args.pre_unshare_uids.real, args.pre_unshare_uids.real);
+        const uid_path = std.mem.printSentinel(&path_buf, "/proc/{}/uid_map", .{helper_pid}, 0) catch unreachable;
+        writeIdMap(uid_path, uids.real, uids.real);
     }
     {
         var path_buf: [64]u8 = undefined;
-        const gid_path = std.mem.printSentinel(&path_buf, "/proc/{}/gid_map", .{parent_pid}, 0) catch unreachable;
-        writeIdMap(gid_path, 0, args.pre_unshare_gids.real);
+        const gid_path = std.mem.printSentinel(&path_buf, "/proc/{}/gid_map", .{helper_pid}, 0) catch unreachable;
+        writeIdMap(gid_path, 0, gids.real);
     }
 
-    // Enter the parent's user and mount namespaces so we can do mounts.
-    enterNamespaces(parent_pid);
+    enterNamespaces(helper_pid);
 
-    // Do all mount operations from inside the parent's namespaces.
-    setupSysroot(io, args.veil_args, args.sysroot_path, args.keep_readwrite) catch |err| {
-        std.log.err("broker: setupSysroot failed: {s}", .{@errorName(err)});
+    closeFd(done[1]);
+    const exit_code = waitHelper(helper_pid);
+    if (exit_code != 0) {
+        std.log.err("namespace helper exited with status {}", .{exit_code});
+        std.process.exit(exit_code);
+    }
+}
+
+fn pipeOrExit() [2]linux.fd_t {
+    var fds: [2]linux.fd_t = undefined;
+    switch (linux.errno(linux.pipe2(&fds, .{ .CLOEXEC = true }))) {
+        .SUCCESS => return fds,
+        else => |e| {
+            std.log.err("pipe2 failed, errno={}", .{e});
+            std.process.exit(0xff);
+        },
+    }
+}
+
+fn readOrExit(fd: linux.fd_t, buf: []u8, name: []const u8) usize {
+    while (true) {
+        const rc = linux.read(fd, buf.ptr, buf.len);
+        switch (linux.errno(rc)) {
+            .SUCCESS => return rc,
+            .INTR => continue,
+            else => |e| {
+                std.log.err("read {s} failed, errno={}", .{ name, e });
+                std.process.exit(0xff);
+            },
+        }
+    }
+}
+
+fn writeOrExit(fd: linux.fd_t, content: []const u8, name: []const u8) void {
+    const rc = linux.write(fd, content.ptr, content.len);
+    switch (linux.errno(rc)) {
+        .SUCCESS => {},
+        else => |e| {
+            std.log.err("write to {s} failed, errno={}", .{ name, e });
+            std.process.exit(0xff);
+        },
+    }
+    if (rc != content.len) {
+        std.log.err("write to {s} returned {} bytes, expected {}", .{ name, rc, content.len });
         std.process.exit(0xff);
-    };
+    }
+}
 
-    std.process.exit(0);
+/// Returns the helper's exit code, exits if it didn't exit normally.
+fn waitHelper(pid: linux.pid_t) u8 {
+    var status_signed: i32 = undefined;
+    while (true) {
+        switch (linux.errno(linux.waitpid(pid, &status_signed, 0))) {
+            .SUCCESS => break,
+            .INTR => continue,
+            else => |e| {
+                std.log.err("waitpid on namespace helper failed, errno={}", .{e});
+                std.process.exit(0xff);
+            },
+        }
+    }
+    const status: u32 = @bitCast(status_signed);
+    if (linux.W.IFSIGNALED(status)) {
+        std.log.err("namespace helper killed by signal {}", .{linux.W.TERMSIG(status)});
+        std.process.exit(0xff);
+    }
+    if (!linux.W.IFEXITED(status)) {
+        std.log.err("namespace helper exited with unexpected status 0x{x}", .{status});
+        std.process.exit(0xff);
+    }
+    return linux.W.EXITSTATUS(status);
 }
 
 pub fn closeFd(fd: linux.fd_t) void {
     switch (linux.errno(linux.close(fd))) {
         // linux has closed the fd even on INTR, see https://github.com/ziglang/zig/issues/2425
         .SUCCESS, .INTR => {},
-        // our fds are eventfds and procfs files, any error is a bug
+        // our fds are pipes and procfs files, any error is a bug
         else => |e| std.debug.panic("close fd {} failed, errno={}", .{ fd, e }),
     }
 }
@@ -169,7 +311,7 @@ fn openOrExit(path: [:0]const u8, flags: linux.O) linux.fd_t {
     return switch (linux.errno(rc)) {
         .SUCCESS => @intCast(rc),
         else => |e| {
-            std.log.err("broker: open '{s}' failed, errno={}", .{ path, e });
+            std.log.err("open '{s}' failed, errno={}", .{ path, e });
             std.process.exit(0xff);
         },
     };
@@ -183,46 +325,46 @@ fn writeProcFile(path: [:0]const u8, content: []const u8) void {
     switch (linux.errno(rc)) {
         .SUCCESS => {},
         else => |e| {
-            std.log.err("broker: write '{s}' to '{s}' failed, errno={}", .{ content, path, e });
+            std.log.err("write '{s}' to '{s}' failed, errno={}", .{ content, path, e });
             std.process.exit(0xff);
         },
     }
     if (rc != content.len) {
-        std.log.err("broker: write to '{s}' returned {} bytes, expected {}", .{ path, rc, content.len });
+        std.log.err("write to '{s}' returned {} bytes, expected {}", .{ path, rc, content.len });
         std.process.exit(0xff);
     }
 }
 
-fn enterNamespaces(parent_pid: linux.pid_t) void {
+fn enterNamespaces(pid: linux.pid_t) void {
     {
         var ns_path_buf: [64]u8 = undefined;
-        const user_ns_path = std.mem.printSentinel(&ns_path_buf, "/proc/{}/ns/user", .{parent_pid}, 0) catch unreachable;
+        const user_ns_path = std.mem.printSentinel(&ns_path_buf, "/proc/{}/ns/user", .{pid}, 0) catch unreachable;
         const user_fd = openOrExit(user_ns_path, .{ .ACCMODE = .RDONLY, .CLOEXEC = true });
         defer closeFd(user_fd);
         switch (linux.errno(linux.syscall2(.setns, @as(usize, @intCast(user_fd)), linux.CLONE.NEWUSER))) {
             .SUCCESS => {},
             else => |e| {
-                std.log.err("broker: setns user failed: E{s}", .{@tagName(e)});
+                std.log.err("setns user failed: E{s}", .{@tagName(e)});
                 std.process.exit(0xff);
             },
         }
     }
     {
         var ns_path_buf: [64]u8 = undefined;
-        const mnt_ns_path = std.mem.printSentinel(&ns_path_buf, "/proc/{}/ns/mnt", .{parent_pid}, 0) catch unreachable;
+        const mnt_ns_path = std.mem.printSentinel(&ns_path_buf, "/proc/{}/ns/mnt", .{pid}, 0) catch unreachable;
         const mnt_fd = openOrExit(mnt_ns_path, .{ .ACCMODE = .RDONLY, .CLOEXEC = true });
         defer closeFd(mnt_fd);
         switch (linux.errno(linux.syscall2(.setns, @as(usize, @intCast(mnt_fd)), linux.CLONE.NEWNS))) {
             .SUCCESS => {},
             else => |e| {
-                std.log.err("broker: setns mnt failed: E{s}", .{@tagName(e)});
+                std.log.err("setns mnt failed: E{s}", .{@tagName(e)});
                 std.process.exit(0xff);
             },
         }
     }
 }
 
-fn setupSysroot(
+pub fn setupSysroot(
     io: Io,
     veil_args: []const [*:0]const u8,
     sysroot_path: [:0]const u8,
@@ -290,19 +432,14 @@ fn setupSysroot(
                 std.log.info("mount --bind '{s}' to '{s}'", .{ src, dst_sysroot });
             }
 
-            var flags: u32 = linux.MS.BIND;
-            var mount_data: ?[*:0]const u8 = null;
-            if (opt_mount_options) |mount_options| {
-                flags |= mount_options.flags;
-                mount_data = mount_options.data;
-            }
-            switch (linux.errno(linux.mount(src, dst_sysroot, mount_data, flags, 0))) {
+            switch (linux.errno(linux.mount(src, dst_sysroot, null, MountOptions.bindFlags(opt_mount_options), 0))) {
                 .SUCCESS => {},
                 else => |errno| {
                     std.log.err("mount failed with E{s}", .{@tagName(errno)});
                     std.process.exit(0xff);
                 },
             }
+            MountOptions.apply(opt_mount_options, dst_sysroot);
         },
         .tmpfs => |tmpfs_cmdline_ptr| {
             const tmpfs_cmdline = std.mem.span(tmpfs_cmdline_ptr);
@@ -320,19 +457,14 @@ fn setupSysroot(
                 std.log.info("mounting tmpfs '{s}'", .{tmpfs_path});
             }
 
-            var flags: u32 = 0;
-            var mount_data: ?[*:0]const u8 = null;
-            if (opt_mount_options) |mount_options| {
-                flags |= mount_options.flags;
-                mount_data = mount_options.data;
-            }
-            switch (linux.errno(linux.mount("none", tmpfs_path, "tmpfs", flags, 0))) {
+            switch (linux.errno(linux.mount("none", tmpfs_path, "tmpfs", 0, 0))) {
                 .SUCCESS => {},
                 else => |errno| {
                     std.log.err("mount tmpfs failed with E{s}", .{@tagName(errno)});
                     std.process.exit(0xff);
                 },
             }
+            MountOptions.apply(opt_mount_options, tmpfs_path);
         },
         .path => |path_ptr| {
             const path = std.mem.span(path_ptr);
@@ -379,14 +511,8 @@ fn setupSysroot(
                     std.log.info("mount --bind '{s}' to '{s}'", .{ path, path_in_sysroot });
                 }
 
-                var flags: u32 = linux.MS.BIND;
-                var mount_data: ?[*:0]const u8 = null;
-                if (opt_mount_options) |mount_options| {
-                    flags |= mount_options.flags;
-                    mount_data = mount_options.data;
-                }
-
-                switch (linux.errno(linux.mount(path, path_in_sysroot, mount_data, flags, 0))) {
+                const flags = MountOptions.bindFlags(opt_mount_options);
+                switch (linux.errno(linux.mount(path, path_in_sysroot, null, flags, 0))) {
                     .SUCCESS => {},
                     else => |errno| {
                         // for some reason I can bind mount /proc on my NixOS machine but not my Ubuntu machine?
@@ -414,6 +540,7 @@ fn setupSysroot(
                         std.process.exit(0xff);
                     },
                 }
+                MountOptions.apply(opt_mount_options, path_in_sysroot);
             } else {
                 std.log.err("'{s}' has unsupported file type {t}", .{ path, stat.kind });
                 std.process.exit(0xff);

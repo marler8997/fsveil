@@ -3,5 +3,6 @@ set -eu
 mkdir -p ~/.cache/zig
 zig=$(readlink -f $(which zig))
 ./zig-out/bin/fsveil \
-    --start-mount-opt nosuid,noexec,nodev,private,recursive /dev /proc --end-mount-opt \
+    --start-mount-opt nosuid,noexec,private,recursive /dev --end-mount-opt \
+    --start-mount-opt nosuid,noexec,nodev,private,recursive /proc --end-mount-opt \
     ~/.cache/zig $(dirname $zig) . -- $zig "$@"
